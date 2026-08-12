@@ -54,7 +54,7 @@ class FailoverManager:
             should be attempted.
         """
 
-        if isinstance(error, httpx.TimeoutException):
+        if isinstance(error, (httpx.TimeoutException, TimeoutError)):
             return FailureDecision(
                 retryable=True,
                 reason="provider_timeout",

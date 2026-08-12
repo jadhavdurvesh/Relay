@@ -10,19 +10,21 @@ from providers.openrouter import OpenRouterProvider
 from router.failover import FailoverManager
 from router.policy import RoutingPolicy
 from schemas.requests import GenerateRequest, GenerateResult
+from telemetry.metrics import MetricsCollector
 
 
 class RelayEngine:
     """
     Core RELAY routing engine.
 
-    The engine is responsible for:
+    Responsible for:
     - discovering configured providers
-    - selecting providers according to the routing policy
+    - selecting providers according to routing policy
     - executing requests
-    - handling retryable provider failures
+    - handling provider failures
     - performing automatic failover
-    - returning a standardized result
+    - recording provider telemetry
+    - returning standardized results
     """
 
     DEFAULT_MODELS = {
@@ -37,6 +39,7 @@ class RelayEngine:
         providers: dict[str, BaseProvider] | None = None,
         policy: RoutingPolicy | None = None,
         failover: FailoverManager | None = None,
+        metrics: MetricsCollector | None = None,
     ) -> None:
         self.settings = settings or get_settings()
 
@@ -53,6 +56,7 @@ class RelayEngine:
         )
 
         self.failover = failover or FailoverManager()
+        self.metrics = metrics or MetricsCollector()
 
     def _build_providers(self) -> dict[str, BaseProvider]:
         """Build provider adapters from configured API keys."""
@@ -95,7 +99,7 @@ class RelayEngine:
         self,
         provider_name: str,
     ) -> BaseProvider:
-        """Return a configured provider or raise an informative error."""
+        """Return a configured provider."""
 
         provider = self.providers.get(provider_name)
 
@@ -111,7 +115,7 @@ class RelayEngine:
         request: GenerateRequest,
         provider_name: str,
     ) -> dict[str, Any]:
-        """Return provider-specific options for a request."""
+        """Return provider-specific options."""
 
         return dict(
             request.provider_options.get(
@@ -124,12 +128,7 @@ class RelayEngine:
         self,
         request: GenerateRequest,
     ) -> GenerateResult:
-        """
-        Execute a generation request through RELAY.
-
-        If a provider fails with a retryable error, RELAY attempts
-        the next provider according to the routing policy.
-        """
+        """Execute a generation request through RELAY."""
 
         available = self.available_providers()
 
@@ -188,12 +187,6 @@ class RelayEngine:
 
             model = request.model or provider.model
 
-            # Respect an explicit model override.
-            if request.model and request.model != provider.model:
-                provider_model = model
-            else:
-                provider_model = provider.model
-
             options = self._provider_options(
                 request,
                 provider_name,
@@ -209,10 +202,22 @@ class RelayEngine:
 
                 fallback_used = attempts > 1
 
+                self.metrics.record_success(
+                    provider=provider_name,
+                    model=model,
+                    latency_ms=response.latency_ms,
+                    input_tokens=response.input_tokens,
+                    output_tokens=response.output_tokens,
+                    total_tokens=response.total_tokens,
+                    attempts=attempts,
+                    fallback_used=fallback_used,
+                    metadata=request.metadata,
+                )
+
                 return GenerateResult(
                     text=response.text,
                     provider=response.provider,
-                    model=provider_model,
+                    model=model,
                     latency_ms=response.latency_ms,
                     input_tokens=response.input_tokens,
                     output_tokens=response.output_tokens,
@@ -229,22 +234,31 @@ class RelayEngine:
 
                 decision = self.failover.classify(error)
 
-                # If the error cannot safely be retried,
-                # stop immediately.
+                self.metrics.record_failure(
+                    provider=provider_name,
+                    model=model,
+                    error=error,
+                    attempts=attempts,
+                    fallback_used=attempts > 1,
+                    metadata={
+                        **request.metadata,
+                        "failover_reason": decision.reason,
+                    },
+                )
+
                 if not decision.retryable:
                     raise
 
-                # If failover is disabled, stop after the failure.
                 if not self.settings.enable_failover:
                     raise
 
-                # Continue to the next provider.
                 continue
 
-        # Every available provider failed.
         if last_error is not None:
             raise RuntimeError(
                 f"All RELAY providers failed after {attempts} attempt(s)."
             ) from last_error
 
-        raise RuntimeError("RELAY failed without receiving a provider response.")
+        raise RuntimeError(
+            "RELAY failed without receiving a provider response."
+        )
