@@ -51,6 +51,7 @@ Issues = "https://github.com/durveshjadhav/relay/issues"
 
 [tool.setuptools]
 include-package-data = true
+py-modules = ["main"]
 
 [tool.setuptools.packages.find]
 include = [
